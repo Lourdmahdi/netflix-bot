@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from typing import Optional, Sequence, Any
 
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ------------ Config ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,17 +39,17 @@ class DB:
         return self.conn.cursor()
 
     def q(self, sql: str) -> str:
-        # Convert ? placeholders to %s for PG
+        # Convert ? placeholders to %s for PostgreSQL
         if self.is_pg:
             return "%s".join(sql.split("?"))
         return sql
 
-    def execute(self, sql: str, params: Sequence[Any]=()):
+    def execute(self, sql: str, params: Sequence[Any] = ()):
         cur = self.cursor()
         cur.execute(self.q(sql), params)
         return cur
 
-    def commit(self): 
+    def commit(self):
         self.conn.commit()
 
     def _ensure_schema(self):
@@ -90,44 +90,65 @@ def parse_kv(text: str):
     out = {}
     for p in shlex.split(text or ""):
         if "=" in p:
-            k,v = p.split("=",1)
+            k, v = p.split("=", 1)
             out[k.strip()] = v.strip()
     return out
 
 def iso_or_none(s: Optional[str]) -> Optional[str]:
-    if not s: return None
+    if not s:
+        return None
     s = s.strip()
-    fmts = ["%Y-%m-%d","%Y/%m/%d","%d-%m-%Y","%d/%m/%Y"]
+    fmts = ["%Y-%m-%d", "YYYY/%m/%d".replace("YYYY", "%Y"), "%d-%m-%Y", "%d/%m/%Y"]
     for f in fmts:
-        try: return datetime.strptime(s,f).date().isoformat()
-        except: pass
-    try: return datetime.fromisoformat(s).date().isoformat()
-    except: return None
+        try:
+            return datetime.strptime(s, f).date().isoformat()
+        except:
+            pass
+    try:
+        return datetime.fromisoformat(s).date().isoformat()
+    except:
+        return None
 
 def today_iso() -> str:
     return datetime.now(TZ).date().isoformat()
 
 def add_months(d: date, months: int) -> date:
-    y = d.year + (d.month - 1 + months)//12
-    m = (d.month - 1 + months)%12 + 1
-    day = min(d.day, monthrange(y,m)[1])
-    return date(y,m,day)
+    y = d.year + (d.month - 1 + months) // 12
+    m = (d.month - 1 + months) % 12 + 1
+    day = min(d.day, monthrange(y, m)[1])
+    return date(y, m, day)
 
 def auto_customer_no(update: Update) -> str:
     base = int(update.message.date.timestamp()) % 100000
     return f"C{(update.effective_user.id % 1000):03d}{base:05d}"
 
+# ------------ Menus (Reply/Inline) ------------
+def main_menu_keyboard(is_admin_user: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("ℹ️ معلومات عن البوت"), KeyboardButton("⭐ مميزات البوت"), KeyboardButton("📚 الشروحات")],
+        [KeyboardButton("➕ إنشاء/إضافة مشترك"), KeyboardButton("🧾 تجديد اشتراك"), KeyboardButton("⏰ قرب الانتهاء")],
+        [KeyboardButton("⬅️ استيراد من CSV"), KeyboardButton("➡️ تصدير CSV")],
+    ]
+    if is_admin_user:
+        rows.append([KeyboardButton("🔐 لوحة المشرف")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+def about_inline_keyboard() -> InlineKeyboardMarkup:
+    btns = [
+        # ضع روابطك هنا إن أردت
+        # [InlineKeyboardButton("قناة التحديثات", url="https://t.me/your_channel")]
+    ]
+    return InlineKeyboardMarkup(btns) if btns else InlineKeyboardMarkup([])
+
 # ------------ Commands ------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_adm = is_admin(update.effective_user.id)
     store = "PostgreSQL" if db.is_pg else "SQLite"
     await update.message.reply_text(
-        "مرحباً 👋 (التخزين: {store})\n"
-        "أوامر الإدارة (أسماء الأوامر بالإنجليزي، الردود بالعربي):\n"
-        "• /addsub اسم= يوزر= معرف= رقم= خطة= بروفايلات= بداية= نهاية= مدفوع= حالة= ملاحظة=\n"
-        "• /renew <رقم_العميل> months=1 paid=0\n"
-        "• /due days=3\n"
-        "• /import  (من subscribers.csv)\n"
-        "• /export  (يحفظ subscribers_export.csv)\n".format(store=store)
+        "مرحباً 👋\n"
+        f"التخزين: {store}\n"
+        "اختر من القائمة بالأسفل:",
+        reply_markup=main_menu_keyboard(is_adm)
     )
 
 @admin_only
@@ -137,13 +158,13 @@ async def cmd_addsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = kv.get("اسم") or kv.get("name") or "بدون اسم"
     tg_username = kv.get("يوزر") or kv.get("tg_username")
     if tg_username and not tg_username.startswith("@"):
-        tg_username = "@"+tg_username
-    tg_user_id = int(kv.get("معرف") or kv.get("tg","0")) if (kv.get("معرف") or kv.get("tg","")).isdigit() else None
+        tg_username = "@" + tg_username
+    tg_user_id = int(kv.get("معرف") or kv.get("tg", "0")) if (kv.get("معرف") or kv.get("tg", "")).isdigit() else None
     customer_no = kv.get("رقم") or kv.get("customer_no") or auto_customer_no(update)
     plan = kv.get("خطة") or kv.get("plan")
     profiles_count = int(kv.get("بروفايلات") or kv.get("profiles_count") or 1)
     start_date = iso_or_none(kv.get("بداية") or kv.get("start")) or today_iso()
-    end_date   = iso_or_none(kv.get("نهاية") or kv.get("end"))
+    end_date = iso_or_none(kv.get("نهاية") or kv.get("end"))
     amount_paid = int(float(kv.get("مدفوع") or kv.get("paid") or 0)) if (kv.get("مدفوع") or kv.get("paid")) else 0
     status = kv.get("حالة") or kv.get("status") or "active"
     note = kv.get("ملاحظة") or kv.get("note") or ""
@@ -157,7 +178,7 @@ async def cmd_addsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
               name=EXCLUDED.name,tg_username=EXCLUDED.tg_username,tg_user_id=EXCLUDED.tg_user_id,
               plan=EXCLUDED.plan,profiles_count=EXCLUDED.profiles_count,start_date=EXCLUDED.start_date,
               end_date=EXCLUDED.end_date,amount_paid=EXCLUDED.amount_paid,status=EXCLUDED.status,note=EXCLUDED.note
-        """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+        """, (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note))
     else:
         db.execute("""
             INSERT INTO subscribers
@@ -167,7 +188,7 @@ async def cmd_addsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
               name=excluded.name,tg_username=excluded.tg_username,tg_user_id=excluded.tg_user_id,
               plan=excluded.plan,profiles_count=excluded.profiles_count,start_date=excluded.start_date,
               end_date=excluded.end_date,amount_paid=excluded.amount_paid,status=excluded.status,note=excluded.note
-        """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+        """, (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note))
     db.commit()
     await update.message.reply_text(f"✅ تم حفظ المشترك: «{name}» (رقم: {customer_no})")
 
@@ -177,7 +198,7 @@ async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await update.message.reply_text("📌 Usage: /renew <customer_no> months=1 paid=0")
     customer_no = parts[1]
-    kv = parse_kv(parts[2] if len(parts)>2 else "")
+    kv = parse_kv(parts[2] if len(parts) > 2 else "")
 
     months = int(kv.get("months", 1))
     paid = int(float(kv.get("paid", 0)))
@@ -225,7 +246,7 @@ async def cmd_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     out.sort(key=lambda x: x[2])
     await update.message.reply_text(
-        "المشتركون الموشكون على الانتهاء:\n" + "\n".join([f"• {n} ({c}) — ينتهي: {d}" for n,c,d in out])
+        "المشتركون الموشكون على الانتهاء:\n" + "\n".join([f"• {n} ({c}) — ينتهي: {d}" for n, c, d in out])
     )
 
 @admin_only
@@ -241,7 +262,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = r.get("name") or "بدون اسم"
             tg_username = r.get("tg_username")
             if tg_username and not tg_username.startswith("@"):
-                tg_username = "@"+tg_username
+                tg_username = "@" + tg_username
             tg_user_id = int(r["tg_user_id"]) if r.get("tg_user_id") and str(r["tg_user_id"]).isdigit() else None
             customer_no = r.get("customer_no") or f"IMP{count:05d}"
             plan = r.get("plan")
@@ -261,7 +282,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       name=EXCLUDED.name,tg_username=EXCLUDED.tg_username,tg_user_id=EXCLUDED.tg_user_id,
                       plan=EXCLUDED.plan,profiles_count=EXCLUDED.profiles_count,start_date=EXCLUDED.start_date,
                       end_date=EXCLUDED.end_date,amount_paid=EXCLUDED.amount_paid,status=EXCLUDED.status,note=EXCLUDED.note
-                """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+                """, (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note))
             else:
                 db.execute("""
                     INSERT INTO subscribers
@@ -271,7 +292,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       name=excluded.name,tg_username=excluded.tg_username,tg_user_id=excluded.tg_user_id,
                       plan=excluded.plan,profiles_count=excluded.profiles_count,start_date=excluded.start_date,
                       end_date=excluded.end_date,amount_paid=excluded.amount_paid,status=excluded.status,note=excluded.note
-                """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+                """, (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note))
             count += 1
     db.commit()
     await update.message.reply_text(f"✅ تم الاستيراد: {count} صف.")
@@ -295,6 +316,77 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"تم الحفظ محلياً: {out_path}\n({e})")
 
+# ------------ Menu Router (text buttons) ------------
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+
+    if txt == "ℹ️ معلومات عن البوت":
+        return await update.message.reply_text(
+            "بوت إدارة الاشتراكات (Netflix وغيرها).\n"
+            "• إضافة/تجديد/عرض قرب الانتهاء\n"
+            "• استيراد/تصدير CSV\n",
+            reply_markup=about_inline_keyboard()
+        )
+
+    if txt == "⭐ مميزات البوت":
+        return await update.message.reply_text(
+            "• أزرار عربية سهلة\n"
+            "• قاعدة بيانات PostgreSQL/SQLite\n"
+            "• استيراد/تصدير CSV\n"
+            "• تنبيهات قرب انتهاء (أمر /due)\n"
+        )
+
+    if txt == "📚 الشروحات":
+        return await update.message.reply_text(
+            "طريقة الاستخدام:\n"
+            "• /addsub اسم= يوزر= معرف= خطة= بداية= نهاية= مدفوع=\n"
+            "• /renew <رقم_العميل> months=1 paid=0\n"
+            "• /due days=3\n"
+            "• /import  | /export\n"
+        )
+
+    if txt == "➕ إنشاء/إضافة مشترك":
+        return await update.message.reply_text(
+            "أرسل الأمر هكذا:\n"
+            '/addsub اسم="أحمد" يوزر=@ahmad معرف=123 خطة="نتفلكس" بداية=2025-10-01 نهاية=2025-11-01 مدفوع=5000'
+        )
+
+    if txt == "🧾 تجديد اشتراك":
+        return await update.message.reply_text(
+            "أرسل الأمر هكذا:\n"
+            "/renew C00001 months=1 paid=5000"
+        )
+
+    if txt == "⏰ قرب الانتهاء":
+        return await update.message.reply_text(
+            "أرسل الأمر هكذا:\n"
+            "/due days=7"
+        )
+
+    if txt == "⬅️ استيراد من CSV":
+        return await update.message.reply_text(
+            "ضع الملف subscribers.csv بجانب البوت ثم أرسل:\n"
+            "/import"
+        )
+
+    if txt == "➡️ تصدير CSV":
+        return await update.message.reply_text(
+            "للحصول على نسخة من المشتركين بصيغة CSV أرسل:\n"
+            "/export"
+        )
+
+    if txt == "🔐 لوحة المشرف":
+        is_adm = is_admin(update.effective_user.id)
+        return await update.message.reply_text(
+            "لوحة المشرف:\n"
+            "• /addsub  • /renew  • /due  • /import  • /export",
+            reply_markup=main_menu_keyboard(is_adm)
+        )
+
+    # إن كان نص غير معروف
+    is_adm = is_admin(update.effective_user.id)
+    return await update.message.reply_text("اختر من الأزرار بالأسفل 👇", reply_markup=main_menu_keyboard(is_adm))
+
 # ------------ Bootstrap ------------
 def main():
     if not BOT_TOKEN:
@@ -303,11 +395,15 @@ def main():
 
     # English command names (Telegram limitation), Arabic replies
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu",  start))      # لفتح القائمة دائمًا
     app.add_handler(CommandHandler("addsub", cmd_addsub))
     app.add_handler(CommandHandler("renew",  cmd_renew))
     app.add_handler(CommandHandler("due",    cmd_due))
     app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("export", cmd_export))
+
+    # Router for reply-keyboard text buttons
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
 
     app.run_polling()
 

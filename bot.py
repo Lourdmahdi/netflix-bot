@@ -274,35 +274,5 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND,custom_router))
     app.run_polling()
 
-if __name__=="__main__": main()s_pg else row["reply"])
-
-# ------------ Menu Router ------------
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt=update.message.text.strip()
-    if txt=="ℹ️ معلومات عن البوت":
-        return await update.message.reply_text("بوت إدارة الاشتراكات 📊\n• إضافة/تجديد\n• استيراد/تصدير CSV\n• أوامر مخصصة ✅")
-    if txt=="⭐ مميزات البوت":
-        return await update.message.reply_text("• أوامر عربية + أزرار\n• PostgreSQL/SQLite\n• أوامر مخصصة")
-    if txt=="📚 الشروحات":
-        return await update.message.reply_text("الاستخدام:\n/addsub ...\n/renew ...\n/due ...\n/import | /export\n/setcommand ...")
-    if txt=="🔐 لوحة المشرف":
-        return await update.message.reply_text("لوحة المشرف:\n/setcommand /delcommand")
-
-# ------------ Main ------------
-def main():
-    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN غير معيّن.")
-    app=Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("menu",start))
-    app.add_handler(CommandHandler("addsub",cmd_addsub))
-    app.add_handler(CommandHandler("renew",cmd_renew))
-    app.add_handler(CommandHandler("due",cmd_due))
-    app.add_handler(CommandHandler("import",cmd_import))
-    app.add_handler(CommandHandler("export",cmd_export))
-    app.add_handler(CommandHandler("setcommand",set_command))
-    app.add_handler(CommandHandler("delcommand",del_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,menu_router))
-    app.add_handler(MessageHandler(filters.COMMAND,custom_router))
-    app.run_polling()
-
-if __name__=="__main__": main()
+if __name__=="__main__":
+    main()

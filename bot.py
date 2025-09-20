@@ -9,6 +9,9 @@ from typing import Optional, Sequence, Any
 from telegram import Update, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+import openai
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 # ------------ Config ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
@@ -140,75 +143,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard(is_adm)
     )
 
-@admin_only
-async def cmd_addsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kv = parse_kv(update.message.text.partition(" ")[2])
-    name = kv.get("اسم") or "بدون اسم"
-    customer_no = kv.get("رقم") or auto_customer_no(update)
-    plan = kv.get("خطة")
-    start_date = iso_or_none(kv.get("بداية")) or today_iso()
-    end_date = iso_or_none(kv.get("نهاية"))
-    amount_paid = int(kv.get("مدفوع", 0))
-
-    db.execute("INSERT INTO subscribers (name,customer_no,plan,start_date,end_date,amount_paid) VALUES (?,?,?,?,?,?) "
-               "ON CONFLICT(customer_no) DO UPDATE SET name=excluded.name, plan=excluded.plan, start_date=excluded.start_date, end_date=excluded.end_date, amount_paid=excluded.amount_paid",
-               (name, customer_no, plan, start_date, end_date, amount_paid))
-    db.commit()
-    await update.message.reply_text(f"✅ تم حفظ المشترك: {name} (رقم: {customer_no})")
-
-@admin_only
-async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.split(maxsplit=2)
-    if len(parts)<2: return await update.message.reply_text("📌 Usage: /renew <customer_no> months=1 paid=0")
-    customer_no = parts[1]
-    kv = parse_kv(parts[2] if len(parts)>2 else "")
-    months = int(kv.get("months",1)); paid = int(kv.get("paid",0))
-    cur = db.execute("SELECT end_date,amount_paid FROM subscribers WHERE customer_no=?", (customer_no,))
-    row = cur.fetchone()
-    if not row: return await update.message.reply_text("⚠️ العميل غير موجود.")
-    end_old = row[0]; paid_old=row[1] or 0
-    base = datetime.fromisoformat(end_old).date() if end_old else datetime.now(TZ).date()
-    new_end=add_months(base,months).isoformat(); new_paid=paid_old+paid
-    db.execute("UPDATE subscribers SET end_date=?,amount_paid=? WHERE customer_no=?", (new_end,new_paid,customer_no))
-    db.commit()
-    await update.message.reply_text(f"✅ تم التجديد حتى: {new_end} | 💵 مدفوع: {paid}")
-
-@admin_only
-async def cmd_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kv = parse_kv(update.message.text); days=int(kv.get("days",3))
-    cur=db.execute("SELECT name,customer_no,end_date FROM subscribers WHERE end_date IS NOT NULL")
-    rows=cur.fetchall(); now=datetime.now(TZ).date(); out=[]
-    for n,c,e in rows:
-        try:
-            ed=datetime.fromisoformat(e).date()
-            if ed<=now+timedelta(days=days): out.append((n,c,e))
-        except: pass
-    if not out: return await update.message.reply_text("لا يوجد مشتركين تنتهي اشتراكاتهم قريباً ✅")
-    msg="الموشكون على الانتهاء:\n"+"\n".join([f"• {n} ({c}) — {d}" for n,c,d in out])
-    await update.message.reply_text(msg)
-
-# ------------ Import/Export ------------
-@admin_only
-async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists("subscribers.csv"): return await update.message.reply_text("⚠️ لا يوجد ملف subscribers.csv")
-    with open("subscribers.csv",newline='',encoding="utf-8-sig") as f:
-        rdr=csv.DictReader(f); count=0
-        for r in rdr:
-            db.execute("INSERT INTO subscribers (name,customer_no,plan,start_date,end_date,amount_paid) VALUES (?,?,?,?,?,?) "
-                       "ON CONFLICT(customer_no) DO UPDATE SET name=excluded.name,plan=excluded.plan,start_date=excluded.start_date,end_date=excluded.end_date,amount_paid=excluded.amount_paid",
-                       (r.get("name"),r.get("customer_no"),r.get("plan"),iso_or_none(r.get("start_date")),iso_or_none(r.get("end_date")),int(r.get("amount_paid",0))))
-            count+=1
-    db.commit(); await update.message.reply_text(f"✅ تم الاستيراد: {count} صف")
-
-@admin_only
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    out="subscribers_export.csv"
-    cur=db.execute("SELECT name,customer_no,plan,start_date,end_date,amount_paid FROM subscribers")
-    rows=cur.fetchall()
-    with open(out,"w",newline="",encoding="utf-8-sig") as f:
-        w=csv.writer(f); w.writerow(["name","customer_no","plan","start_date","end_date","amount_paid"]); w.writerows(rows)
-    await update.message.reply_document(InputFile(out),filename=out,caption="⬇️ ملف التصدير")
-
 # ------------ Custom Commands ------------
 @admin_only
 async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,7 +164,22 @@ async def custom_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd=update.message.text[1:].split()[0]
     cur=db.execute("SELECT reply FROM custom_cmds WHERE cmd=?", (cmd,))
     row=cur.fetchone()
-    if row: await update.message.reply_text(row[0] if not db.is_pg else row["reply"])
+    if row:
+        return await update.message.reply_text(row[0] if not db.is_pg else row["reply"])
+
+# ------------ AI Handler ------------
+async def ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    try:
+        response = openai.Completion.create(
+            model="text-davinci-003",
+            prompt=user_text,
+            max_tokens=200,
+            temperature=0.7
+        )
+        await update.message.reply_text(response["choices"][0]["text"].strip())
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ خطأ في استدعاء الذكاء الصناعي: {e}")
 
 # ------------ Menu Router ------------
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,7 +187,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt=="ℹ️ معلومات عن البوت":
         return await update.message.reply_text("بوت إدارة الاشتراكات 📊\n• إضافة/تجديد\n• استيراد/تصدير CSV\n• أوامر مخصصة ✅")
     if txt=="⭐ مميزات البوت":
-        return await update.message.reply_text("• أزرار عربية سهلة\n• PostgreSQL/SQLite\n• أوامر مخصصة\n• لوحة مشرف")
+        return await update.message.reply_text("• أزرار عربية سهلة\n• PostgreSQL/SQLite\n• أوامر مخصصة\n• ذكاء صناعي 🤖")
     if txt=="📚 الشروحات":
         return await update.message.reply_text("الاستخدام:\n/addsub ...\n/renew ...\n/due ...\n/import | /export\n/setcommand ...")
     if txt=="🔐 لوحة المشرف":
@@ -261,17 +210,18 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN غير معيّن.")
     app=Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("menu",start))
-    app.add_handler(CommandHandler("addsub",cmd_addsub))
-    app.add_handler(CommandHandler("renew",cmd_renew))
-    app.add_handler(CommandHandler("due",cmd_due))
-    app.add_handler(CommandHandler("import",cmd_import))
-    app.add_handler(CommandHandler("export",cmd_export))
     app.add_handler(CommandHandler("setcommand",set_command))
     app.add_handler(CommandHandler("delcommand",del_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,menu_router))
-    app.add_handler(MessageHandler(filters.COMMAND,custom_router))
+
+    # أولاً: أوامر ثابتة (لوحة وأزرار)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
+    # ثانياً: أوامر مخصصة
+    app.add_handler(MessageHandler(filters.COMMAND, custom_router))
+    # ثالثاً: أي نص عادي ➝ AI
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_reply))
+
     app.run_polling()
 
 if __name__=="__main__":

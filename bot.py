@@ -1,333 +1,313 @@
 # -*- coding: utf-8 -*-
-import os
-import csv
-import sqlite3
-from datetime import datetime, timedelta, time
+import os, csv
+from datetime import datetime, date, timedelta
+from calendar import monthrange
 from zoneinfo import ZoneInfo
 from functools import wraps
-from typing import Optional
+from typing import Optional, Sequence, Any
 
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ====== الإعدادات ======
+# ------------ Config ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}  # مثال: "123,456"
-DB_PATH = os.getenv("DB_PATH", "subs.db")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 TZ = ZoneInfo("Asia/Baghdad")
 
-# ====== قاعدة البيانات ======
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS subscribers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        tg_username TEXT,
-        tg_user_id INTEGER,
-        customer_no TEXT UNIQUE,
-        plan TEXT,
-        profiles_count INTEGER DEFAULT 1,
-        start_date TEXT,
-        end_date TEXT,
-        amount_paid INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'active',
-        note TEXT
-    )
-    """)
-    conn.commit()
-    return conn
+USE_PG = bool(os.getenv("DATABASE_URL"))
+if USE_PG:
+    import psycopg2 as pg
+    import psycopg2.extras as pg_extras
+else:
+    import sqlite3
 
-# ====== أدوات مساعدة ======
+# ------------ DB Layer ------------
+class DB:
+    def __init__(self):
+        self.is_pg = USE_PG
+        self.conn = self._connect()
+        self._ensure_schema()
+
+    def _connect(self):
+        if self.is_pg:
+            return pg.connect(os.getenv("DATABASE_URL"), sslmode=os.getenv("PG_SSLMODE", "require"))
+        return sqlite3.connect(os.getenv("DB_PATH", "subs.db"), check_same_thread=False)
+
+    def cursor(self):
+        if self.is_pg:
+            return self.conn.cursor(cursor_factory=pg_extras.DictCursor)
+        return self.conn.cursor()
+
+    def q(self, sql: str) -> str:
+        # Convert ? placeholders to %s for PG
+        if self.is_pg:
+            return "%s".join(sql.split("?"))
+        return sql
+
+    def execute(self, sql: str, params: Sequence[Any]=()):
+        cur = self.cursor()
+        cur.execute(self.q(sql), params)
+        return cur
+
+    def commit(self): 
+        self.conn.commit()
+
+    def _ensure_schema(self):
+        self.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            tg_username TEXT,
+            tg_user_id BIGINT,
+            customer_no TEXT UNIQUE,
+            plan TEXT,
+            profiles_count INT DEFAULT 1,
+            start_date TEXT,
+            end_date TEXT,
+            amount_paid INT DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            note TEXT
+        )
+        """)
+        self.commit()
+
+db = DB()
+
+# ------------ Helpers ------------
 def is_admin(user_id: Optional[int]) -> bool:
     return bool(user_id) and (user_id in ADMIN_IDS)
 
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else None
-        if not is_admin(uid):
+def admin_only(fn):
+    @wraps(fn)
+    async def w(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
             return await update.message.reply_text("❌ غير مسموح.")
-        return await func(update, context)
-    return wrapper
+        return await fn(update, context)
+    return w
 
-def parse_kv_ar(text: str):
-    """
-    يحوّل نصاً يحتوي أزواج مفتاح=قيمة (يدعم الاقتباسات)
-    مثال: اسم="أحمد علي" يوزر=@ahmad معرف=123 بداية=2025-10-01
-    """
+def parse_kv(text: str):
     import shlex
-    parts = shlex.split(text or "")
     out = {}
-    for p in parts:
+    for p in shlex.split(text or ""):
         if "=" in p:
-            k, v = p.split("=", 1)
+            k,v = p.split("=",1)
             out[k.strip()] = v.strip()
     return out
 
 def iso_or_none(s: Optional[str]) -> Optional[str]:
-    """يُعيد التاريخ بصيغة ISO YYYY-MM-DD إذا أمكن، أو None."""
-    if not s:
-        return None
+    if not s: return None
     s = s.strip()
-    # السماح بصيغ شائعة
-    fmts = ["%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"]
+    fmts = ["%Y-%m-%d","%Y/%m/%d","%d-%m-%Y","%d/%m/%Y"]
     for f in fmts:
-        try:
-            return datetime.strptime(s, f).date().isoformat()
-        except Exception:
-            pass
-    # إذا كان أصلاً ISO صحيح
-    try:
-        return datetime.fromisoformat(s).date().isoformat()
-    except Exception:
-        return None
+        try: return datetime.strptime(s,f).date().isoformat()
+        except: pass
+    try: return datetime.fromisoformat(s).date().isoformat()
+    except: return None
 
-def today_iraq_iso() -> str:
+def today_iso() -> str:
     return datetime.now(TZ).date().isoformat()
+
+def add_months(d: date, months: int) -> date:
+    y = d.year + (d.month - 1 + months)//12
+    m = (d.month - 1 + months)%12 + 1
+    day = min(d.day, monthrange(y,m)[1])
+    return date(y,m,day)
 
 def auto_customer_no(update: Update) -> str:
     base = int(update.message.date.timestamp()) % 100000
     return f"C{(update.effective_user.id % 1000):03d}{base:05d}"
 
-# ====== أوامر عامة ======
+# ------------ Commands ------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store = "PostgreSQL" if db.is_pg else "SQLite"
     await update.message.reply_text(
-        "مرحباً 👋\n"
-        "أوامر الإدارة:\n"
-        "• /اضافة اسم= يوزر= معرف= رقم= خطة= بروفايلات= بداية= نهاية= مدفوع= حالة= ملاحظة=\n"
-        "• /تجديد <رقم_العميل> اشهر= مدفوع=\n"
-        "• /قرب_الانتهاء أيام=3\n"
-        "• /استيراد  (من subscribers.csv)\n"
-        "• /تصدير    (يحفظ subscribers_export.csv)\n"
+        "مرحباً 👋 (التخزين: {store})\n"
+        "أوامر الإدارة (أسماء الأوامر بالإنجليزي، الردود بالعربي):\n"
+        "• /addsub اسم= يوزر= معرف= رقم= خطة= بروفايلات= بداية= نهاية= مدفوع= حالة= ملاحظة=\n"
+        "• /renew <رقم_العميل> months=1 paid=0\n"
+        "• /due days=3\n"
+        "• /import  (من subscribers.csv)\n"
+        "• /export  (يحفظ subscribers_export.csv)\n".format(store=store)
     )
 
-# ====== أوامر إدارية ======
 @admin_only
-async def اضافة(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args_text = update.message.text.partition(" ")[2]
-    kv = parse_kv_ar(args_text)
+async def cmd_addsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kv = parse_kv(update.message.text.partition(" ")[2])
 
-    name = kv.get("اسم") or "بدون اسم"
-    tg_username = kv.get("يوزر")
+    name = kv.get("اسم") or kv.get("name") or "بدون اسم"
+    tg_username = kv.get("يوزر") or kv.get("tg_username")
     if tg_username and not tg_username.startswith("@"):
-        tg_username = "@" + tg_username
+        tg_username = "@"+tg_username
+    tg_user_id = int(kv.get("معرف") or kv.get("tg","0")) if (kv.get("معرف") or kv.get("tg","")).isdigit() else None
+    customer_no = kv.get("رقم") or kv.get("customer_no") or auto_customer_no(update)
+    plan = kv.get("خطة") or kv.get("plan")
+    profiles_count = int(kv.get("بروفايلات") or kv.get("profiles_count") or 1)
+    start_date = iso_or_none(kv.get("بداية") or kv.get("start")) or today_iso()
+    end_date   = iso_or_none(kv.get("نهاية") or kv.get("end"))
+    amount_paid = int(float(kv.get("مدفوع") or kv.get("paid") or 0)) if (kv.get("مدفوع") or kv.get("paid")) else 0
+    status = kv.get("حالة") or kv.get("status") or "active"
+    note = kv.get("ملاحظة") or kv.get("note") or ""
 
-    tg_user_id = None
-    try:
-        tg_user_id = int(kv["معرف"]) if "معرف" in kv and kv["معرف"].isdigit() else None
-    except Exception:
-        tg_user_id = None
-
-    customer_no = kv.get("رقم") or auto_customer_no(update)
-    plan = kv.get("خطة")
-    profiles_count = int(kv.get("بروفايلات", 1))
-
-    start_date = iso_or_none(kv.get("بداية")) or today_iraq_iso()
-    end_date = iso_or_none(kv.get("نهاية"))
-
-    amount_paid = 0
-    try:
-        amount_paid = int(float(kv.get("مدفوع", 0)))
-    except Exception:
-        amount_paid = 0
-
-    status = kv.get("حالة", "active")
-    note = kv.get("ملاحظة", "")
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO subscribers
-        (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note))
-    conn.commit()
-    conn.close()
-
+    if db.is_pg:
+        db.execute("""
+            INSERT INTO subscribers
+            (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (customer_no) DO UPDATE SET
+              name=EXCLUDED.name,tg_username=EXCLUDED.tg_username,tg_user_id=EXCLUDED.tg_user_id,
+              plan=EXCLUDED.plan,profiles_count=EXCLUDED.profiles_count,start_date=EXCLUDED.start_date,
+              end_date=EXCLUDED.end_date,amount_paid=EXCLUDED.amount_paid,status=EXCLUDED.status,note=EXCLUDED.note
+        """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+    else:
+        db.execute("""
+            INSERT INTO subscribers
+            (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(customer_no) DO UPDATE SET
+              name=excluded.name,tg_username=excluded.tg_username,tg_user_id=excluded.tg_user_id,
+              plan=excluded.plan,profiles_count=excluded.profiles_count,start_date=excluded.start_date,
+              end_date=excluded.end_date,amount_paid=excluded.amount_paid,status=excluded.status,note=excluded.note
+        """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+    db.commit()
     await update.message.reply_text(f"✅ تم حفظ المشترك: «{name}» (رقم: {customer_no})")
 
 @admin_only
-async def تجديد(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = (update.message.text or "").split(maxsplit=2)
+async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = update.message.text.split(maxsplit=2)
     if len(parts) < 2:
-        return await update.message.reply_text("📌 الصيغة: /تجديد <رقم_العميل> اشهر=1 مدفوع=0")
-
+        return await update.message.reply_text("📌 Usage: /renew <customer_no> months=1 paid=0")
     customer_no = parts[1]
-    kv = parse_kv_ar(parts[2] if len(parts) > 2 else "")
+    kv = parse_kv(parts[2] if len(parts)>2 else "")
 
-    months = 1
-    try:
-        months = int(kv.get("اشهر", 1))
-    except Exception:
-        months = 1
+    months = int(kv.get("months", 1))
+    paid = int(float(kv.get("paid", 0)))
 
-    paid = 0
-    try:
-        paid = int(float(kv.get("مدفوع", 0)))
-    except Exception:
-        paid = 0
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT end_date, amount_paid FROM subscribers WHERE customer_no=?", (customer_no,))
+    cur = db.execute("SELECT end_date, amount_paid FROM subscribers WHERE customer_no=?", (customer_no,))
     row = cur.fetchone()
     if not row:
-        conn.close()
         return await update.message.reply_text("⚠️ العميل غير موجود.")
 
-    end_date_old, amount_paid_old = row
-    amount_paid_old = amount_paid_old or 0
+    end_old = row["end_date"] if db.is_pg else row[0]
+    paid_old = (row["amount_paid"] if db.is_pg else row[1]) or 0
 
-    # تحديد تاريخ الأساس: إن لم يوجد/غير صالح → اليوم
     try:
-        base = datetime.fromisoformat(end_date_old).date()
-    except Exception:
+        base = datetime.fromisoformat(end_old).date() if end_old else datetime.now(TZ).date()
+    except:
         base = datetime.now(TZ).date()
 
-    # إضافة أشهر
-    from dateutil.relativedelta import relativedelta
-    new_end = (base + relativedelta(months=months)).isoformat()
-    new_paid = amount_paid_old + paid
+    new_end = add_months(base, months).isoformat()
+    new_paid = paid_old + paid
 
-    cur.execute("UPDATE subscribers SET end_date=?, amount_paid=? WHERE customer_no=?",
-                (new_end, new_paid, customer_no))
-    conn.commit()
-    conn.close()
-
+    db.execute("UPDATE subscribers SET end_date=?, amount_paid=? WHERE customer_no=?", (new_end, new_paid, customer_no))
+    db.commit()
     await update.message.reply_text(f"✅ تم التجديد حتى: {new_end}\n💵 إضافة مدفوع: {paid}")
 
 @admin_only
-async def قرب_الانتهاء(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kv = parse_kv_ar(update.message.text or "")
-    days = 3
-    try:
-        days = int(kv.get("أيام", 3))
-    except Exception:
-        days = 3
+async def cmd_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kv = parse_kv(update.message.text)
+    days = int(kv.get("days", 3))
 
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT name, customer_no, end_date
-        FROM subscribers
-        WHERE end_date IS NOT NULL
-          AND date(end_date) <= date('now', ?)
-        ORDER BY date(end_date)
-    """, (f'+{days} day',))
-    rows = cur.fetchall()
-    conn.close()
+    cur = db.execute("SELECT name, customer_no, end_date FROM subscribers WHERE end_date IS NOT NULL")
+    rows = cur.fetchall() or []
+    now = datetime.now(TZ).date()
+    out = []
+    for r in rows:
+        name, cust, endd = (r["name"], r["customer_no"], r["end_date"]) if db.is_pg else (r[0], r[1], r[2])
+        try:
+            ed = datetime.fromisoformat(endd).date()
+            if ed <= now + timedelta(days=days):
+                out.append((name, cust, endd))
+        except:
+            pass
 
-    if not rows:
+    if not out:
         return await update.message.reply_text("لا يوجد مشتركون تنتهي اشتراكاتهم قريبًا ✅")
 
-    lines = [f"• {n} ({c}) — ينتهي: {d}" for n, c, d in rows]
-    await update.message.reply_text("المشتركون الموشكون على الانتهاء:\n" + "\n".join(lines))
+    out.sort(key=lambda x: x[2])
+    await update.message.reply_text(
+        "المشتركون الموشكون على الانتهاء:\n" + "\n".join([f"• {n} ({c}) — ينتهي: {d}" for n,c,d in out])
+    )
 
 @admin_only
-async def استيراد(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يستورد من subscribers.csv الموجود بجانب البوت.
-    الحقول المقبولة: name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note
-    """
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = "subscribers.csv"
     if not os.path.exists(path):
         return await update.message.reply_text("⚠️ لم أجد الملف subscribers.csv في مجلد المشروع.")
 
-    conn = db()
-    cur = conn.cursor()
-    added, replaced = 0, 0
-
+    count = 0
     with open(path, newline='', encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            # تنظيف وتحويل
+        rdr = csv.DictReader(f)
+        for r in rdr:
             name = r.get("name") or "بدون اسم"
             tg_username = r.get("tg_username")
             if tg_username and not tg_username.startswith("@"):
-                tg_username = "@" + tg_username
-            try:
-                tg_user_id = int(r["tg_user_id"]) if r.get("tg_user_id") else None
-            except Exception:
-                tg_user_id = None
-
-            customer_no = r.get("customer_no") or f"C{added:05d}"
+                tg_username = "@"+tg_username
+            tg_user_id = int(r["tg_user_id"]) if r.get("tg_user_id") and str(r["tg_user_id"]).isdigit() else None
+            customer_no = r.get("customer_no") or f"IMP{count:05d}"
             plan = r.get("plan")
-            try:
-                profiles_count = int(r.get("profiles_count") or 1)
-            except Exception:
-                profiles_count = 1
-
-            start_date = iso_or_none(r.get("start_date")) or today_iraq_iso()
+            profiles_count = int(r.get("profiles_count") or 1)
+            start_date = iso_or_none(r.get("start_date")) or today_iso()
             end_date = iso_or_none(r.get("end_date"))
-            try:
-                amount_paid = int(float(r.get("amount_paid") or 0))
-            except Exception:
-                amount_paid = 0
+            amount_paid = int(float(r.get("amount_paid") or 0))
             status = r.get("status") or "active"
             note = r.get("note") or ""
 
-            # INSERT OR REPLACE يحدّث لو وُجد customer_no
-            cur.execute("""
-                INSERT OR REPLACE INTO subscribers
-                (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (name, tg_username, tg_user_id, customer_no, plan, profiles_count, start_date, end_date, amount_paid, status, note))
-            # تقدير بسيطة للعدّ
-            if cur.rowcount == 1:
-                added += 1
+            if db.is_pg:
+                db.execute("""
+                    INSERT INTO subscribers
+                    (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (customer_no) DO UPDATE SET
+                      name=EXCLUDED.name,tg_username=EXCLUDED.tg_username,tg_user_id=EXCLUDED.tg_user_id,
+                      plan=EXCLUDED.plan,profiles_count=EXCLUDED.profiles_count,start_date=EXCLUDED.start_date,
+                      end_date=EXCLUDED.end_date,amount_paid=EXCLUDED.amount_paid,status=EXCLUDED.status,note=EXCLUDED.note
+                """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
             else:
-                replaced += 1
-
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ تم الاستيراد.\nجديد: {added} | تحديث: {replaced}")
+                db.execute("""
+                    INSERT INTO subscribers
+                    (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(customer_no) DO UPDATE SET
+                      name=excluded.name,tg_username=excluded.tg_username,tg_user_id=excluded.tg_user_id,
+                      plan=excluded.plan,profiles_count=excluded.profiles_count,start_date=excluded.start_date,
+                      end_date=excluded.end_date,amount_paid=excluded.amount_paid,status=excluded.status,note=excluded.note
+                """, (name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note))
+            count += 1
+    db.commit()
+    await update.message.reply_text(f"✅ تم الاستيراد: {count} صف.")
 
 @admin_only
-async def تصدير(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يصدر كل المشتركين إلى subscribers_export.csv ويرسله كملف.
-    """
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out_path = "subscribers_export.csv"
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
+    cur = db.execute("""
         SELECT name,tg_username,tg_user_id,customer_no,plan,profiles_count,start_date,end_date,amount_paid,status,note
-        FROM subscribers
-        ORDER BY id DESC
+        FROM subscribers ORDER BY id DESC
     """)
-    rows = cur.fetchall()
-    conn.close()
-
+    rows = cur.fetchall() or []
     headers = ["name","tg_username","tg_user_id","customer_no","plan","profiles_count","start_date","end_date","amount_paid","status","note"]
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(headers)
-        for row in rows:
-            w.writerow(row)
-
+        w = csv.writer(f); w.writerow(headers)
+        for r in rows:
+            if db.is_pg: w.writerow([r[h] for h in headers])
+            else: w.writerow(list(r))
     try:
-        await update.message.reply_document(InputFile(out_path), filename=os.path.basename(out_path),
-                                            caption="⬇️ تم إنشاء ملف التصدير")
+        await update.message.reply_document(InputFile(out_path), filename=out_path, caption="⬇️ تم إنشاء ملف التصدير")
     except Exception as e:
         await update.message.reply_text(f"تم الحفظ محلياً: {out_path}\n({e})")
 
-# ====== نقطة التشغيل ======
+# ------------ Bootstrap ------------
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN غير معيّن في المتغيرات البيئية.")
-
+        raise RuntimeError("BOT_TOKEN غير معيّن.")
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # أوامر عامة
-    app.add_handler(CommandHandler(["start", "ابدأ"], start))
-
-    # أوامر إدارية
-    app.add_handler(CommandHandler("اضافة", اضافة))
-    app.add_handler(CommandHandler("تجديد", تجديد))
-    app.add_handler(CommandHandler("قرب_الانتهاء", قرب_الانتهاء))
-    app.add_handler(CommandHandler("استيراد", استيراد))
-    app.add_handler(CommandHandler("تصدير", تصدير))
+    # English command names (Telegram limitation), Arabic replies
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("addsub", cmd_addsub))
+    app.add_handler(CommandHandler("renew",  cmd_renew))
+    app.add_handler(CommandHandler("due",    cmd_due))
+    app.add_handler(CommandHandler("import", cmd_import))
+    app.add_handler(CommandHandler("export", cmd_export))
 
     app.run_polling()
 

@@ -486,9 +486,16 @@ async def daily_reminders(context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"- #{c} | {n} | {p} | {fmt_date(e)}")
             await context.bot.send_message(chat_id=admin_id, text="\n".join(lines))
 
-def schedule_jobs(app: Application):
-    # تشغيل يومي 10:00 صباحًا بتوقيت بغداد
-    app.job_queue.run_daily(daily_reminders, time=time(10, 0, tzinfo=TZ))
+# >>> النسخة الصحيحة للجدولة مع PTB v20 <<<
+def schedule_jobs(application: Application):
+    # يشغّل daily_reminders كل يوم الساعة 10:00 صباحًا بتوقيت بغداد
+    application.job_queue.run_daily(
+        daily_reminders,
+        time=time(10, 0, tzinfo=TZ),
+        name="daily_reminders"
+    )
+    # (اختياري) اختبار سريع بعد الإقلاع بـ 20 ثانية:
+    # application.job_queue.run_once(daily_reminders, when=20, name="boot_test")
 
 # ====== الإقلاع ======
 def main():
@@ -500,23 +507,26 @@ def main():
     # تأكد من تهيئة قاعدة البيانات
     conn = db(); conn.close()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addsub", addsub))
-    app.add_handler(CommandHandler("editsub", editsub))
-    app.add_handler(CommandHandler("setstatus", setstatus))
-    app.add_handler(CommandHandler("renew", renew))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("active", active_cmd))
-    app.add_handler(CommandHandler("due", due_cmd))
-    app.add_handler(CommandHandler("find", find_cmd))
-    app.add_handler(CommandHandler("export", export_cmd))
-    app.add_handler(CommandHandler("invoice", invoice_cmd))
-    app.add_handler(CommandHandler("sendmsg", sendmsg_cmd))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("addsub", addsub))
+    application.add_handler(CommandHandler("editsub", editsub))
+    application.add_handler(CommandHandler("setstatus", setstatus))
+    application.add_handler(CommandHandler("renew", renew))
+    application.add_handler(CommandHandler("list", list_cmd))
+    application.add_handler(CommandHandler("active", active_cmd))
+    application.add_handler(CommandHandler("due", due_cmd))
+    application.add_handler(CommandHandler("find", find_cmd))
+    application.add_handler(CommandHandler("export", export_cmd))
+    application.add_handler(CommandHandler("invoice", invoice_cmd))
+    application.add_handler(CommandHandler("sendmsg", sendmsg_cmd))
 
-    schedule_jobs(app)
-    app.run_polling()
+    # جدولة التذكيرات اليومية
+    schedule_jobs(application)
+
+    # تشغيل البوت
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
